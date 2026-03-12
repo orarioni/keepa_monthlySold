@@ -130,13 +130,17 @@ python keepa_enrich.py --mode burst --dry-run
 ```
 
 ### 実行ファイル（配布先）
-配布先では `KeepaMonthlySales.exe` と同じフォルダに
+配布先では **cmd.exe 用バッチ** を使って起動してください（ダブルクリック実行可）。
+`KeepaMonthlySales.exe` と同じフォルダに以下を置く前提です。
 - `config.ini`
 - `output.xlsx`
-を置いて、用途に応じて以下を実行します。
+- `asin_cache.csv`（初回は未作成でも可）
 - `run.bat`（single）
 - `run_burst.bat`（burst）
 - `run_drip.bat`（drip）
+
+各 `.bat` は `cd /d "%~dp0"` で自身のフォルダへ移動してから exe を起動します。
+異常終了時はメッセージを表示し、`keepa_enrich.log` の確認を案内します。
 
 ## ローカル Windows での PyInstaller ビルド例
 > Codex 上では exe ビルドせず、以下をローカル Windows で実行してください。
@@ -156,8 +160,11 @@ pyinstaller --noconfirm --clean --onedir --name KeepaMonthlySales keepa_enrich.p
 dist\KeepaMonthlySales\
   KeepaMonthlySales.exe
   run.bat
+  run_burst.bat
+  run_drip.bat
   config.ini         # config.ini.example をコピーして作成
   output.xlsx        # Amazon_Price_search の出力
+  asin_cache.csv     # 初回は未作成でも可（実行後に生成）
 ```
 
 Keepa product API への問い合わせは最大100 ASIN単位でまとめて送信し、返却productsに存在しないASINは `keepa_product_not_found` としてASIN単位で扱います。
