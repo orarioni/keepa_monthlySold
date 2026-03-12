@@ -16,3 +16,6 @@ reserve_tokens = 10
 tokens_per_minute = 5
 interval_seconds = 60
 max_minutes = 480
+stop_when_tokens_below = 10
+max_zero_budget_cycles = 3
+max_token_status_failures = 3

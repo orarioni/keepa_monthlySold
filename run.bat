@@ -2,7 +2,7 @@
 rem Keepa Monthly Sales - single mode launcher for cmd.exe
 cd /d "%~dp0"
 
-KeepaMonthlySales.exe --mode single
+KeepaMonthlySales.exe --mode single --stop-when-tokens-below 10
 if errorlevel 1 (
   echo エラーで終了しました。keepa_enrich.log を確認してください。
 ) else (

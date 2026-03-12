@@ -1,6 +1,17 @@
 import unittest
+from unittest.mock import patch
 
-from keepa_enrich import compute_burst_budget, compute_drip_budget, run_single_mode, select_fetch_batch
+from keepa_enrich import (
+    compute_burst_budget,
+    compute_drip_budget,
+    parse_args,
+    run_single_mode,
+    select_fetch_batch,
+    should_stop_by_token_threshold,
+    should_stop_by_usable_tokens,
+    should_stop_token_status_failures,
+    should_stop_zero_budget_cycles,
+)
 
 
 class RunModeLogicTests(unittest.TestCase):
@@ -76,6 +87,34 @@ class RunModeLogicTests(unittest.TestCase):
         queued = ["A1", "A2"]
         batch = select_fetch_batch(queued, budget=0)
         self.assertEqual(batch, [])
+
+    def test_single_stop_when_tokens_below_threshold(self):
+        self.assertTrue(should_stop_by_token_threshold(available_tokens=10, threshold=10))
+
+    def test_burst_stop_when_usable_tokens_exhausted(self):
+        self.assertTrue(should_stop_by_usable_tokens(available_tokens=10, reserve_tokens=10))
+
+    def test_drip_stop_when_zero_budget_cycles_exceeded(self):
+        self.assertTrue(should_stop_zero_budget_cycles(zero_budget_cycles=3, max_zero_budget_cycles=3))
+
+    def test_drip_stop_when_token_status_failures_exceeded(self):
+        self.assertTrue(should_stop_token_status_failures(token_status_failures=3, max_token_status_failures=3))
+
+    def test_cli_includes_token_stop_options(self):
+        settings = {
+            "default_mode": "single",
+            "reserve_tokens": 10,
+            "tokens_per_minute": 5,
+            "interval_seconds": 60,
+            "max_minutes": 480,
+            "stop_when_tokens_below": 10,
+            "max_zero_budget_cycles": 3,
+            "max_token_status_failures": 3,
+        }
+        with patch("sys.argv", ["keepa_enrich.py", "--mode", "drip", "--stop-when-tokens-below", "8"]):
+            args = parse_args(settings)
+        self.assertEqual(args.mode, "drip")
+        self.assertEqual(args.stop_when_tokens_below, 8)
 
 
 if __name__ == "__main__":

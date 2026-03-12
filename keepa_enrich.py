@@ -31,6 +31,9 @@ DEFAULT_RESERVE_TOKENS = 10
 DEFAULT_TOKENS_PER_MINUTE = 5.0
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_MAX_MINUTES = 480
+DEFAULT_STOP_WHEN_TOKENS_BELOW = 10
+DEFAULT_MAX_ZERO_BUDGET_CYCLES = 3
+DEFAULT_MAX_TOKEN_STATUS_FAILURES = 3
 DEFAULT_MAX_BATCH_SIZE = 100
 TOKEN_COST_PER_ASIN = 1
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
@@ -174,6 +177,9 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "tokens_per_minute": config.getfloat("run", "tokens_per_minute", fallback=DEFAULT_TOKENS_PER_MINUTE),
         "interval_seconds": config.getint("run", "interval_seconds", fallback=DEFAULT_INTERVAL_SECONDS),
         "max_minutes": config.getint("run", "max_minutes", fallback=DEFAULT_MAX_MINUTES),
+        "stop_when_tokens_below": config.getint("run", "stop_when_tokens_below", fallback=DEFAULT_STOP_WHEN_TOKENS_BELOW),
+        "max_zero_budget_cycles": config.getint("run", "max_zero_budget_cycles", fallback=DEFAULT_MAX_ZERO_BUDGET_CYCLES),
+        "max_token_status_failures": config.getint("run", "max_token_status_failures", fallback=DEFAULT_MAX_TOKEN_STATUS_FAILURES),
     }
 
     settings["input_path"] = (base_dir / settings["input_excel"]).resolve()
@@ -569,6 +575,13 @@ def build_summary(df: pd.DataFrame, metrics: dict[str, Any], coefficient: float)
         "effective_tokens_per_minute": float(metrics.get("effective_tokens_per_minute", 0.0)),
         "max_minutes_reached": bool(metrics.get("max_minutes_reached", False)),
         "queue_exhausted": bool(metrics.get("queue_exhausted", False)),
+        "stop_reason": metrics.get("stop_reason", ""),
+        "stop_when_tokens_below": int(metrics.get("stop_when_tokens_below", 0)),
+        "max_zero_budget_cycles": int(metrics.get("max_zero_budget_cycles", 0)),
+        "max_token_status_failures": int(metrics.get("max_token_status_failures", 0)),
+        "zero_budget_cycles": int(metrics.get("zero_budget_cycles", 0)),
+        "token_status_failures": int(metrics.get("token_status_failures", 0)),
+        "last_available_tokens": int(metrics.get("last_available_tokens", 0)),
         "coefficient_value": float(coefficient),
     }
 
@@ -590,6 +603,9 @@ def parse_args(settings: dict[str, Any]) -> argparse.Namespace:
     parser.add_argument("--interval-seconds", type=int, default=settings["interval_seconds"])
     parser.add_argument("--max-minutes", type=int, default=settings["max_minutes"])
     parser.add_argument("--max-fetches", type=int, default=None)
+    parser.add_argument("--stop-when-tokens-below", type=int, default=settings["stop_when_tokens_below"])
+    parser.add_argument("--max-zero-budget-cycles", type=int, default=settings["max_zero_budget_cycles"])
+    parser.add_argument("--max-token-status-failures", type=int, default=settings["max_token_status_failures"])
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -610,6 +626,40 @@ def get_token_status(api_key: str, timeout_sec: int, logger: logging.Logger) -> 
     except Exception as exc:  # noqa: BLE001
         logger.warning("token_status_unavailable detail=%s", str(exc))
         return 0
+
+
+def get_token_status_safe(api_key: str, timeout_sec: int, logger: logging.Logger) -> tuple[int | None, bool]:
+    url = "https://api.keepa.com/token"
+    try:
+        response = requests.get(url, params={"key": api_key}, timeout=timeout_sec)
+        response.raise_for_status()
+        payload = response.json()
+        tokens = payload.get("tokensLeft")
+        if tokens is None:
+            tokens = payload.get("tokensleft")
+        if tokens is None:
+            logger.warning("token_status_unavailable detail=missing_tokens_field")
+            return None, False
+        return max(0, int(tokens)), True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("token_status_unavailable detail=%s", str(exc))
+        return None, False
+
+
+def should_stop_by_token_threshold(available_tokens: int, threshold: int) -> bool:
+    return available_tokens <= threshold
+
+
+def should_stop_by_usable_tokens(available_tokens: int, reserve_tokens: int) -> bool:
+    return max(0, available_tokens - reserve_tokens) <= 0
+
+
+def should_stop_zero_budget_cycles(zero_budget_cycles: int, max_zero_budget_cycles: int) -> bool:
+    return zero_budget_cycles >= max_zero_budget_cycles
+
+
+def should_stop_token_status_failures(token_status_failures: int, max_token_status_failures: int) -> bool:
+    return token_status_failures >= max_token_status_failures
 
 
 def compute_burst_budget(available_tokens: int, reserve_tokens: int, queue_count: int, max_fetches: int | None) -> int:
@@ -777,7 +827,11 @@ def main() -> None:
         logger.info("ASIN=%s queue_decision=%s fetch_priority=%s", decision.asin, decision.decision, decision.priority)
 
     queued_asins = sort_queued_asins(queue_decisions)
-    available_tokens_at_start = get_token_status(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger) if args.mode in {"burst", "drip"} else 0
+    available_tokens_at_start = 0
+    last_available_tokens = 0
+    stop_reason = ""
+    zero_budget_cycles = 0
+    token_status_failures = 0
 
     fetch_metrics: dict[str, Any] = {
         "communication_error_count": 0,
@@ -795,7 +849,37 @@ def main() -> None:
         total_sleep_seconds = 0.0
         max_minutes_reached = False
         queue_exhausted = selected_fetch_count >= len(queued_asins)
+        available_tokens, token_ok = get_token_status_safe(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger)
+        if token_ok and available_tokens is not None:
+            available_tokens_at_start = available_tokens
+            last_available_tokens = available_tokens
+            if should_stop_by_token_threshold(available_tokens, args.stop_when_tokens_below):
+                selected_asins = []
+                selected_fetch_count = 0
+                queue_exhausted = False
+                stop_reason = "tokens_below_threshold"
+                logger.info(
+                    "mode=single stop_reason=tokens_below_threshold available_tokens=%s stop_when_tokens_below=%s",
+                    available_tokens,
+                    args.stop_when_tokens_below,
+                )
+        else:
+            token_status_failures = 1
+            if should_stop_token_status_failures(token_status_failures, args.max_token_status_failures):
+                selected_asins = []
+                selected_fetch_count = 0
+                queue_exhausted = False
+                stop_reason = "token_status_failures_exceeded"
+                logger.info("mode=single stop_reason=token_status_failures_exceeded token_status_failures=%s", token_status_failures)
     elif args.mode == "burst":
+        available_tokens, token_ok = get_token_status_safe(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger)
+        if token_ok and available_tokens is not None:
+            available_tokens_at_start = available_tokens
+            last_available_tokens = available_tokens
+        else:
+            token_status_failures = 1
+            available_tokens_at_start = 0
+
         selected_asins, selected_fetch_count, cycle_count, is_dry = run_burst_mode(
             queued_asins=queued_asins,
             reserve_tokens=args.reserve_tokens,
@@ -806,13 +890,31 @@ def main() -> None:
         total_sleep_seconds = 0.0
         max_minutes_reached = False
         queue_exhausted = selected_fetch_count >= len(queued_asins)
+
+        if not token_ok and should_stop_token_status_failures(token_status_failures, args.max_token_status_failures):
+            selected_asins = []
+            selected_fetch_count = 0
+            queue_exhausted = False
+            stop_reason = "token_status_failures_exceeded"
+        elif should_stop_by_token_threshold(available_tokens_at_start, args.stop_when_tokens_below):
+            selected_asins = []
+            selected_fetch_count = 0
+            queue_exhausted = False
+            stop_reason = "tokens_below_threshold"
+        elif should_stop_by_usable_tokens(available_tokens_at_start, args.reserve_tokens):
+            selected_asins = []
+            selected_fetch_count = 0
+            queue_exhausted = False
+            stop_reason = "usable_tokens_exhausted"
+
         logger.info(
-            "mode=burst available_tokens=%s reserve_tokens=%s cycle_budget=%s selected_fetch_count=%s remaining_queue_count=%s",
+            "mode=burst available_tokens=%s reserve_tokens=%s cycle_budget=%s selected_fetch_count=%s remaining_queue_count=%s stop_reason=%s",
             available_tokens_at_start,
             args.reserve_tokens,
             selected_fetch_count,
             selected_fetch_count,
             len(queued_asins) - selected_fetch_count,
+            stop_reason,
         )
     else:
         selected_asins = []
@@ -827,10 +929,31 @@ def main() -> None:
             elapsed_minutes = (time.time() - drip_start) / 60.0
             if elapsed_minutes >= args.max_minutes:
                 max_minutes_reached = True
+                stop_reason = "max_minutes_reached"
                 break
 
             cycle_count += 1
-            available_tokens = get_token_status(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger)
+            available_tokens, token_ok = get_token_status_safe(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger)
+            if token_ok and available_tokens is not None:
+                token_status_failures = 0
+                last_available_tokens = available_tokens
+            else:
+                token_status_failures += 1
+                available_tokens = last_available_tokens
+                if should_stop_token_status_failures(token_status_failures, args.max_token_status_failures):
+                    stop_reason = "token_status_failures_exceeded"
+                    logger.info("mode=drip stop_reason=token_status_failures_exceeded token_status_failures=%s", token_status_failures)
+                    break
+
+            if should_stop_by_token_threshold(available_tokens, args.stop_when_tokens_below):
+                stop_reason = "tokens_below_threshold"
+                logger.info(
+                    "mode=drip stop_reason=tokens_below_threshold available_tokens=%s stop_when_tokens_below=%s",
+                    available_tokens,
+                    args.stop_when_tokens_below,
+                )
+                break
+
             remaining_queue = len(queued_asins) - queue_index
             cycle_budget = compute_drip_budget(
                 available_tokens=available_tokens,
@@ -840,6 +963,19 @@ def main() -> None:
                 queue_count=remaining_queue,
                 max_fetches=None if args.max_fetches is None else max(0, args.max_fetches - selected_fetch_count),
             )
+            if cycle_budget == 0:
+                zero_budget_cycles += 1
+            else:
+                zero_budget_cycles = 0
+            if should_stop_zero_budget_cycles(zero_budget_cycles, args.max_zero_budget_cycles):
+                stop_reason = "zero_budget_cycles_exceeded"
+                logger.info(
+                    "mode=drip stop_reason=zero_budget_cycles_exceeded zero_budget_cycles=%s max_zero_budget_cycles=%s",
+                    zero_budget_cycles,
+                    args.max_zero_budget_cycles,
+                )
+                break
+
             batch = select_fetch_batch(queued_asins[queue_index:], cycle_budget)
             selected_fetch_count += len(batch)
             selected_asins.extend(batch)
@@ -887,17 +1023,32 @@ def main() -> None:
             if queue_index >= len(queued_asins):
                 break
             if args.max_fetches is not None and selected_fetch_count >= args.max_fetches:
+                stop_reason = "max_fetches_reached"
                 break
             if args.dry_run:
+                stop_reason = "dry_run_completed"
                 break
 
             time.sleep(args.interval_seconds)
             total_sleep_seconds += args.interval_seconds
 
         queue_exhausted = queue_index >= len(queued_asins)
+        if queue_exhausted and not stop_reason:
+            stop_reason = "queue_exhausted"
         is_dry = args.dry_run
 
     logger.info("mode=%s selected_fetch_count=%s total_queue_count=%s", args.mode, selected_fetch_count, len(queued_asins))
+
+    if args.mode == "single" and not stop_reason and args.dry_run:
+        stop_reason = "dry_run_completed"
+    if args.mode == "single" and not stop_reason and queue_exhausted:
+        stop_reason = "queue_exhausted"
+    if args.mode == "burst" and not stop_reason and queue_exhausted:
+        stop_reason = "queue_exhausted"
+    if args.mode == "burst" and not stop_reason and args.max_fetches is not None and selected_fetch_count >= args.max_fetches:
+        stop_reason = "max_fetches_reached"
+    if args.mode == "burst" and not stop_reason and args.dry_run:
+        stop_reason = "dry_run_completed"
 
     if args.mode in {"single", "burst"} and not is_dry and selected_asins:
         batches = [selected_asins[i:i + DEFAULT_MAX_BATCH_SIZE] for i in range(0, len(selected_asins), DEFAULT_MAX_BATCH_SIZE)]
@@ -960,6 +1111,13 @@ def main() -> None:
         "effective_tokens_per_minute": 0.0 if args.mode != "drip" else (selected_fetch_count / max((time.time()-run_start)/60.0, 1e-9)),
         "max_minutes_reached": bool(max_minutes_reached),
         "queue_exhausted": bool(queue_exhausted),
+        "stop_reason": stop_reason,
+        "stop_when_tokens_below": args.stop_when_tokens_below,
+        "max_zero_budget_cycles": args.max_zero_budget_cycles,
+        "max_token_status_failures": args.max_token_status_failures,
+        "zero_budget_cycles": zero_budget_cycles,
+        "token_status_failures": token_status_failures,
+        "last_available_tokens": last_available_tokens,
     }
 
     fetch_metrics.update(fetch_result_metrics)
@@ -967,6 +1125,8 @@ def main() -> None:
     fetch_metrics.update(queue_metrics)
 
     summary = build_summary(enriched, fetch_metrics, coefficient)
+    if stop_reason:
+        logger.info("stop_reason=%s", stop_reason)
     log_and_print_summary(summary, logger)
     if is_dry:
         logger.info("Dry-run completed. API fetch and file outputs were skipped.")

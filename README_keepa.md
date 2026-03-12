@@ -83,6 +83,9 @@ reserve_tokens = 10
 tokens_per_minute = 5
 interval_seconds = 60
 max_minutes = 480
+stop_when_tokens_below = 10
+max_zero_budget_cycles = 3
+max_token_status_failures = 3
 ```
 
 APIキーの優先順:
@@ -107,7 +110,8 @@ APIキーの優先順:
 - `interval_seconds` ごとに token status を見ながら安全な件数だけ進め、各サイクルでその場で実 fetch とキャッシュ更新を行います。
 - 予算式: `target_tokens_this_cycle = tokens_per_minute * interval_seconds / 60`（整数化）
 - `available_tokens - reserve_tokens` を超えるときは自動で減速します。
-- トークン不足時は 0 件のループを許容し、待機とログを継続します。
+- トークン不足時は 0 件のループを許容しますが、`max_zero_budget_cycles` 回連続で 0 件なら安全停止します。
+- token status 取得失敗も連続カウントし、`max_token_status_failures` 到達時に安全停止します。
 
 ### reserve_tokens の意味
 - Keepaトークンを使い切らないための安全余力です。
@@ -118,14 +122,31 @@ APIキーの優先順:
 - `burst`: 予算消化またはキュー消化で終了
 - `drip`: `max_minutes` 到達、`max_fetches` 到達、またはキュー消化で終了
 
+
+### token 安全停止パラメータ
+- `stop_when_tokens_below`: available tokens がこの値以下なら停止
+- `max_zero_budget_cycles`: drip で budget=0 が連続した場合の停止上限
+- `max_token_status_failures`: token status API 失敗の連続停止上限
+
+停止理由はサマリとログの `stop_reason` で確認できます。
+主な値:
+- `tokens_below_threshold`
+- `usable_tokens_exhausted`
+- `zero_budget_cycles_exceeded`
+- `token_status_failures_exceeded`
+- `max_minutes_reached`
+- `queue_exhausted`
+- `max_fetches_reached`
+- `dry_run_completed`
+
 ## 実行方法
 
 ### Python で実行（開発時）
 ```bash
 pip install -r requirements.txt
-python keepa_enrich.py --mode single
-python keepa_enrich.py --mode burst --reserve-tokens 10
-python keepa_enrich.py --mode drip --tokens-per-minute 5 --interval-seconds 60 --max-minutes 480
+python keepa_enrich.py --mode single --stop-when-tokens-below 10
+python keepa_enrich.py --mode burst --reserve-tokens 10 --stop-when-tokens-below 10
+python keepa_enrich.py --mode drip --tokens-per-minute 5 --interval-seconds 60 --max-minutes 480 --stop-when-tokens-below 10 --max-zero-budget-cycles 3 --max-token-status-failures 3
 python keepa_enrich.py --mode burst --dry-run
 ```
 
@@ -214,6 +235,13 @@ Keepa product API への問い合わせは最大100 ASIN単位でまとめて送
 - `effective_tokens_per_minute`（drip）
 - `max_minutes_reached`（drip）
 - `queue_exhausted`（drip）
+- `stop_reason`
+- `stop_when_tokens_below`
+- `max_zero_budget_cycles`
+- `max_token_status_failures`
+- `zero_budget_cycles`
+- `token_status_failures`
+- `last_available_tokens`
 - `coefficient_value`
 
 ## よくある失敗と対処

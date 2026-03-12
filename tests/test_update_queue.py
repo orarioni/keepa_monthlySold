@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from keepa_enrich import build_keepa_data_from_cache, enrich_dataframe, format_keepa_last_sold_update
+from keepa_enrich import build_keepa_data_from_cache, build_summary, enrich_dataframe, format_keepa_last_sold_update
 from update_queue import decide_fetch_queue, load_cache, save_cache
 
 
@@ -140,6 +140,23 @@ class UpdateQueueTests(unittest.TestCase):
             save_cache(cache, cache_path)
             loaded = load_cache(cache_path)
             self.assertEqual(loaded.loc[0, "asin"], "A1")
+
+    def test_summary_contains_stop_reason(self):
+        df = pd.DataFrame({"ASIN": ["A1"], "estimate_source": ["monthlySold"]})
+        summary = build_summary(
+            df,
+            metrics={
+                "stop_reason": "tokens_below_threshold",
+                "stop_when_tokens_below": 10,
+                "max_zero_budget_cycles": 3,
+                "max_token_status_failures": 3,
+                "zero_budget_cycles": 1,
+                "token_status_failures": 0,
+                "last_available_tokens": 10,
+            },
+            coefficient=1.0,
+        )
+        self.assertEqual(summary["stop_reason"], "tokens_below_threshold")
 
 
 if __name__ == "__main__":
