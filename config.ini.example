@@ -4,7 +4,26 @@ api_key =
 [files]
 input_excel = output.xlsx
 output_excel = output_keepa.xlsx
+asin_cache = asin_cache.csv
 
 [app]
 log_file = keepa_enrich.log
 timeout_sec = 30
+
+[run]
+default_mode = single
+reserve_tokens = 10
+tokens_per_minute = 5
+interval_seconds = 60
+max_minutes = 480
+stop_when_tokens_below = 10
+max_zero_budget_cycles = 3
+max_token_status_failures = 3
+
+[refresh_policy]
+communication_error_minutes = 30
+keepa_product_not_found_days = 7
+monthly_sold_present_days = 7
+sales_rank_only_days = 3
+both_missing_days = 2
+other_failure_days = 1
