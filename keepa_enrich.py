@@ -180,6 +180,14 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "stop_when_tokens_below": config.getint("run", "stop_when_tokens_below", fallback=DEFAULT_STOP_WHEN_TOKENS_BELOW),
         "max_zero_budget_cycles": config.getint("run", "max_zero_budget_cycles", fallback=DEFAULT_MAX_ZERO_BUDGET_CYCLES),
         "max_token_status_failures": config.getint("run", "max_token_status_failures", fallback=DEFAULT_MAX_TOKEN_STATUS_FAILURES),
+        "refresh_policy": {
+            "communication_error_minutes": config.getint("refresh_policy", "communication_error_minutes", fallback=30),
+            "keepa_product_not_found_days": config.getint("refresh_policy", "keepa_product_not_found_days", fallback=7),
+            "monthly_sold_present_days": config.getint("refresh_policy", "monthly_sold_present_days", fallback=7),
+            "sales_rank_only_days": config.getint("refresh_policy", "sales_rank_only_days", fallback=3),
+            "both_missing_days": config.getint("refresh_policy", "both_missing_days", fallback=2),
+            "other_failure_days": config.getint("refresh_policy", "other_failure_days", fallback=1),
+        },
     }
 
     settings["input_path"] = (base_dir / settings["input_excel"]).resolve()
@@ -446,6 +454,7 @@ def build_cache_updates(
     coefficient: float,
     now: datetime,
     attempted_asins: set[str],
+    refresh_policy: dict[str, int],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     cache_idx = existing_cache.set_index("asin", drop=False) if not existing_cache.empty else pd.DataFrame(columns=["asin"]).set_index("asin", drop=False)
     failure_by_asin = fetch_metrics.get("failure_by_asin", {})
@@ -472,6 +481,7 @@ def build_cache_updates(
                 failure_type=None,
                 monthly_sold=est["keepa_monthlySold"],
                 drops30=est["keepa_salesRankDrops30"],
+                refresh_policy=refresh_policy,
             )
         elif attempted and failure_type:
             fetched_failure_count += 1
@@ -490,6 +500,7 @@ def build_cache_updates(
                 failure_type=failure_type,
                 monthly_sold=est["keepa_monthlySold"],
                 drops30=est["keepa_salesRankDrops30"],
+                refresh_policy=refresh_policy,
             )
         else:
             if old is None:
@@ -507,6 +518,7 @@ def build_cache_updates(
                 failure_type=failure_type,
                 monthly_sold=est["keepa_monthlySold"],
                 drops30=est["keepa_salesRankDrops30"],
+                refresh_policy=refresh_policy,
             )
 
         updates.append(
@@ -1013,6 +1025,7 @@ def main() -> None:
                     coefficient=cycle_coefficient,
                     now=datetime.now(),
                     attempted_asins=set(batch),
+                    refresh_policy=settings["refresh_policy"],
                 )
                 for row in cycle_updates:
                     row["fetch_priority"] = priority_by_asin.get(row["asin"], "low")
@@ -1077,6 +1090,7 @@ def main() -> None:
             coefficient=coefficient,
             now=now,
             attempted_asins=attempted_asins,
+            refresh_policy=settings["refresh_policy"],
         )
         priority_by_asin = {d.asin: d.priority for d in queue_decisions}
         for row in cache_updates:

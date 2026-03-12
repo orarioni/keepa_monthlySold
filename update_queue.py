@@ -36,6 +36,15 @@ RETRY_DELAYS = {
     "both_missing": timedelta(days=2),
 }
 
+DEFAULT_REFRESH_POLICY = {
+    "communication_error_minutes": 30,
+    "keepa_product_not_found_days": 7,
+    "other_failure_days": 1,
+    "monthly_sold_present_days": 7,
+    "sales_rank_only_days": 3,
+    "both_missing_days": 2,
+}
+
 STALE_FETCH_DAYS = 14
 STALE_LAST_SOLD_UPDATE_DAYS = 30
 HIGH_ROWS_THRESHOLD = 20
@@ -100,21 +109,29 @@ def save_cache(cache: pd.DataFrame, cache_path: Path, logger: Any = None) -> Non
         raise
 
 
-def compute_next_fetch_after(now: datetime, failure_type: str | None, monthly_sold: Any, drops30: Any) -> datetime:
+def compute_next_fetch_after(
+    now: datetime,
+    failure_type: str | None,
+    monthly_sold: Any,
+    drops30: Any,
+    refresh_policy: dict[str, int] | None = None,
+) -> datetime:
+    policy = {**DEFAULT_REFRESH_POLICY, **(refresh_policy or {})}
+
     if failure_type == "communication_error":
-        return now + RETRY_DELAYS["communication_error"]
+        return now + timedelta(minutes=int(policy["communication_error_minutes"]))
     if failure_type == "keepa_product_not_found":
-        return now + RETRY_DELAYS["keepa_product_not_found"]
+        return now + timedelta(days=int(policy["keepa_product_not_found_days"]))
     if failure_type:
-        return now + RETRY_DELAYS["other_failure"]
+        return now + timedelta(days=int(policy["other_failure_days"]))
 
     monthly = safe_float(monthly_sold)
     drops = safe_float(drops30)
     if monthly is not None and monthly >= 1:
-        return now + RETRY_DELAYS["monthly_sold_present"]
+        return now + timedelta(days=int(policy["monthly_sold_present_days"]))
     if drops is not None:
-        return now + RETRY_DELAYS["drops_only"]
-    return now + RETRY_DELAYS["both_missing"]
+        return now + timedelta(days=int(policy["sales_rank_only_days"]))
+    return now + timedelta(days=int(policy["both_missing_days"]))
 
 
 def decide_fetch_queue(valid_asins: list[str], rows_seen: dict[str, int], cache: pd.DataFrame, now: datetime) -> list[QueueDecision]:

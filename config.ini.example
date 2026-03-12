@@ -19,3 +19,11 @@ max_minutes = 480
 stop_when_tokens_below = 10
 max_zero_budget_cycles = 3
 max_token_status_failures = 3
+
+[refresh_policy]
+communication_error_minutes = 30
+keepa_product_not_found_days = 7
+monthly_sold_present_days = 7
+sales_rank_only_days = 3
+both_missing_days = 2
+other_failure_days = 1

@@ -86,11 +86,32 @@ max_minutes = 480
 stop_when_tokens_below = 10
 max_zero_budget_cycles = 3
 max_token_status_failures = 3
+
+[refresh_policy]
+communication_error_minutes = 30
+keepa_product_not_found_days = 7
+monthly_sold_present_days = 7
+sales_rank_only_days = 3
+both_missing_days = 2
+other_failure_days = 1
 ```
 
 APIキーの優先順:
 1. `config.ini` の `[keepa] api_key`
 2. 環境変数 `KEEPA_API_KEY`
+
+
+### refresh_policy（next_fetch_after の運用調整）
+`next_fetch_after` の計算に使う待機期間は `[refresh_policy]` で変更できます。
+
+- `communication_error_minutes`
+- `keepa_product_not_found_days`
+- `monthly_sold_present_days`
+- `sales_rank_only_days`
+- `both_missing_days`
+- `other_failure_days`
+
+未設定時は既存デフォルト（30分 / 7日 / 7日 / 3日 / 2日 / 1日）を使います。
 
 
 ## 実行モード（single / burst / drip）

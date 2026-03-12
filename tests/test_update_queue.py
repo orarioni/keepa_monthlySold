@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from keepa_enrich import build_keepa_data_from_cache, build_summary, enrich_dataframe, format_keepa_last_sold_update
-from update_queue import decide_fetch_queue, load_cache, save_cache
+from update_queue import compute_next_fetch_after, decide_fetch_queue, load_cache, save_cache
 
 
 class UpdateQueueTests(unittest.TestCase):
@@ -157,6 +157,17 @@ class UpdateQueueTests(unittest.TestCase):
             coefficient=1.0,
         )
         self.assertEqual(summary["stop_reason"], "tokens_below_threshold")
+
+    def test_next_fetch_after_uses_refresh_policy_override(self):
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        next_at = compute_next_fetch_after(
+            now=now,
+            failure_type="communication_error",
+            monthly_sold=None,
+            drops30=None,
+            refresh_policy={"communication_error_minutes": 45},
+        )
+        self.assertEqual(next_at, now + timedelta(minutes=45))
 
 
 if __name__ == "__main__":
