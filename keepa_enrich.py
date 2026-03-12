@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 
 from update_queue import (
+    DEFAULT_REFRESH_POLICY,
     compute_next_fetch_after,
     decide_fetch_queue,
     load_cache,
@@ -181,12 +182,36 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "max_zero_budget_cycles": config.getint("run", "max_zero_budget_cycles", fallback=DEFAULT_MAX_ZERO_BUDGET_CYCLES),
         "max_token_status_failures": config.getint("run", "max_token_status_failures", fallback=DEFAULT_MAX_TOKEN_STATUS_FAILURES),
         "refresh_policy": {
-            "communication_error_minutes": config.getint("refresh_policy", "communication_error_minutes", fallback=30),
-            "keepa_product_not_found_days": config.getint("refresh_policy", "keepa_product_not_found_days", fallback=7),
-            "monthly_sold_present_days": config.getint("refresh_policy", "monthly_sold_present_days", fallback=7),
-            "sales_rank_only_days": config.getint("refresh_policy", "sales_rank_only_days", fallback=3),
-            "both_missing_days": config.getint("refresh_policy", "both_missing_days", fallback=2),
-            "other_failure_days": config.getint("refresh_policy", "other_failure_days", fallback=1),
+            "communication_error_minutes": config.getint(
+                "refresh_policy",
+                "communication_error_minutes",
+                fallback=DEFAULT_REFRESH_POLICY["communication_error_minutes"],
+            ),
+            "keepa_product_not_found_days": config.getint(
+                "refresh_policy",
+                "keepa_product_not_found_days",
+                fallback=DEFAULT_REFRESH_POLICY["keepa_product_not_found_days"],
+            ),
+            "monthly_sold_present_days": config.getint(
+                "refresh_policy",
+                "monthly_sold_present_days",
+                fallback=DEFAULT_REFRESH_POLICY["monthly_sold_present_days"],
+            ),
+            "sales_rank_only_days": config.getint(
+                "refresh_policy",
+                "sales_rank_only_days",
+                fallback=DEFAULT_REFRESH_POLICY["sales_rank_only_days"],
+            ),
+            "both_missing_days": config.getint(
+                "refresh_policy",
+                "both_missing_days",
+                fallback=DEFAULT_REFRESH_POLICY["both_missing_days"],
+            ),
+            "other_failure_days": config.getint(
+                "refresh_policy",
+                "other_failure_days",
+                fallback=DEFAULT_REFRESH_POLICY["other_failure_days"],
+            ),
         },
     }
 
