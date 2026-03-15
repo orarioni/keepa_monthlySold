@@ -243,35 +243,35 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "max_zero_budget_cycles": config.getint("run", "max_zero_budget_cycles", fallback=DEFAULT_MAX_ZERO_BUDGET_CYCLES),
         "max_token_status_failures": config.getint("run", "max_token_status_failures", fallback=DEFAULT_MAX_TOKEN_STATUS_FAILURES),
         "refresh_policy": {
-            "communication_error_minutes": config.getint(
+            "active_high_days": config.getint(
                 "refresh_policy",
-                "communication_error_minutes",
-                fallback=DEFAULT_REFRESH_POLICY["communication_error_minutes"],
+                "active_high_days",
+                fallback=DEFAULT_REFRESH_POLICY["active_high_days"],
             ),
-            "keepa_product_not_found_days": config.getint(
+            "active_medium_days": config.getint(
                 "refresh_policy",
-                "keepa_product_not_found_days",
-                fallback=DEFAULT_REFRESH_POLICY["keepa_product_not_found_days"],
+                "active_medium_days",
+                fallback=DEFAULT_REFRESH_POLICY["active_medium_days"],
             ),
-            "monthly_sold_present_days": config.getint(
+            "active_low_days": config.getint(
                 "refresh_policy",
-                "monthly_sold_present_days",
-                fallback=DEFAULT_REFRESH_POLICY["monthly_sold_present_days"],
+                "active_low_days",
+                fallback=DEFAULT_REFRESH_POLICY["active_low_days"],
             ),
-            "sales_rank_only_days": config.getint(
+            "inactive_days": config.getint(
                 "refresh_policy",
-                "sales_rank_only_days",
-                fallback=DEFAULT_REFRESH_POLICY["sales_rank_only_days"],
+                "inactive_days",
+                fallback=DEFAULT_REFRESH_POLICY["inactive_days"],
             ),
-            "both_missing_days": config.getint(
+            "max_retry_backoff_days": config.getint(
                 "refresh_policy",
-                "both_missing_days",
-                fallback=DEFAULT_REFRESH_POLICY["both_missing_days"],
+                "max_retry_backoff_days",
+                fallback=DEFAULT_REFRESH_POLICY["max_retry_backoff_days"],
             ),
-            "other_failure_days": config.getint(
+            "inactive_unchanged_days": config.getint(
                 "refresh_policy",
-                "other_failure_days",
-                fallback=DEFAULT_REFRESH_POLICY["other_failure_days"],
+                "inactive_unchanged_days",
+                fallback=DEFAULT_REFRESH_POLICY["inactive_unchanged_days"],
             ),
         },
     }
@@ -574,17 +574,18 @@ def build_cache_updates(
             keepa_info = fetched_keepa_data[asin]
             est = build_estimation(asin, keepa_info, coefficient)
             fetched_success_count += 1
-            consecutive_failures = 0
+            consecutive_errors = 0
             last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_success_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_failure_at = old.get("last_failure_at") if old is not None else None
             next_fetch_after = compute_next_fetch_after(
                 now=now,
-                failure_type=None,
                 monthly_sold=est["keepa_monthlySold"],
-                drops30=est["keepa_salesRankDrops30"],
+                consecutive_errors=consecutive_errors,
                 refresh_policy=refresh_policy,
             )
+            last_error = None
+            last_result_status = "success"
         elif attempted and failure_type:
             fetched_failure_count += 1
             if old is not None:
@@ -592,36 +593,48 @@ def build_cache_updates(
                 est = build_estimation(asin, keepa_info, coefficient)
             else:
                 est = build_estimation(asin, None, coefficient)
-            previous_failures = int(safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
-            consecutive_failures = previous_failures + 1
+            previous_errors = int(safe_float(old.get("consecutive_errors")) or safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
+            consecutive_errors = previous_errors + 1
             last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_success_at = old.get("last_success_at") if old is not None else None
             last_failure_at = now.strftime("%Y-%m-%d %H:%M:%S")
             next_fetch_after = compute_next_fetch_after(
                 now=now,
-                failure_type=failure_type,
                 monthly_sold=est["keepa_monthlySold"],
-                drops30=est["keepa_salesRankDrops30"],
+                consecutive_errors=consecutive_errors,
                 refresh_policy=refresh_policy,
             )
+            last_error = failure_type
+            last_result_status = "failure"
         else:
             if old is None:
                 continue
             keepa_info = keepa_row_from_cache(old)
             est = build_estimation(asin, keepa_info, coefficient)
             failure_type = old.get("failure_type")
-            consecutive_failures = int(safe_float(old.get("consecutive_failures")) or 0)
+            consecutive_errors = int(safe_float(old.get("consecutive_errors")) or safe_float(old.get("consecutive_failures")) or 0)
             last_fetched_at = old.get("last_fetched_at")
             last_success_at = old.get("last_success_at")
             last_failure_at = old.get("last_failure_at")
             next_fetch_after_text = old.get("next_fetch_after")
             next_fetch_after = pd.to_datetime(next_fetch_after_text).to_pydatetime() if next_fetch_after_text else compute_next_fetch_after(
                 now=now,
-                failure_type=failure_type,
                 monthly_sold=est["keepa_monthlySold"],
-                drops30=est["keepa_salesRankDrops30"],
+                consecutive_errors=consecutive_errors,
                 refresh_policy=refresh_policy,
             )
+            last_error = old.get("last_error")
+            last_result_status = old.get("last_result_status")
+
+        prev_monthly = safe_float(old.get("keepa_monthlySold")) if old is not None else None
+        prev_drops = safe_float(old.get("keepa_salesRankDrops30")) if old is not None else None
+        prev_last_sold = old.get("keepa_lastSoldUpdate") if old is not None else None
+        changed = (
+            prev_monthly != safe_float(est["keepa_monthlySold"])
+            or prev_drops != safe_float(est["keepa_salesRankDrops30"])
+            or prev_last_sold != est["keepa_lastSoldUpdate"]
+        )
+        last_change_at = now.strftime("%Y-%m-%d %H:%M:%S") if changed else (old.get("last_change_at") if old is not None else now.strftime("%Y-%m-%d %H:%M:%S"))
 
         updates.append(
             {
@@ -640,7 +653,10 @@ def build_cache_updates(
                 "rows_seen_in_input": rows_seen.get(asin, 0),
                 "fetch_priority": None,
                 "next_fetch_after": next_fetch_after.strftime("%Y-%m-%d %H:%M:%S"),
-                "consecutive_failures": consecutive_failures,
+                "consecutive_errors": consecutive_errors,
+                "last_error": last_error,
+                "last_result_status": last_result_status,
+                "last_change_at": last_change_at,
             }
         )
 
@@ -939,7 +955,13 @@ def main() -> None:
     cache_df = load_cache(settings["cache_path"])
     queue_decisions = decide_fetch_queue(valid_asins=valid_asins, rows_seen=rows_seen, cache=cache_df, now=now)
     for decision in queue_decisions:
-        logger.info("ASIN=%s queue_decision=%s fetch_priority=%s", decision.asin, decision.decision, decision.priority)
+        logger.info(
+            "ASIN=%s queue_decision=%s fetch_priority=%s reason=%s",
+            decision.asin,
+            decision.decision,
+            decision.priority,
+            decision.reason,
+        )
 
     queued_asins = sort_queued_asins(queue_decisions)
     available_tokens_at_start = 0
