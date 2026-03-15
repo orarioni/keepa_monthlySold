@@ -532,6 +532,13 @@ def keepa_row_from_cache(cache_row: pd.Series | None) -> dict[str, Any] | None:
     }
 
 
+def read_consecutive_errors(cache_row: pd.Series | None) -> int:
+    """Backward compatibility: prefer consecutive_errors, fallback to consecutive_failures."""
+    if cache_row is None:
+        return 0
+    return int(safe_float(cache_row.get("consecutive_errors")) or safe_float(cache_row.get("consecutive_failures")) or 0)
+
+
 def build_keepa_data_from_cache(valid_asins: list[str], cache_df: pd.DataFrame) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     keepa_data: dict[str, dict[str, Any]] = {}
     cache_hit = 0
@@ -593,7 +600,7 @@ def build_cache_updates(
                 est = build_estimation(asin, keepa_info, coefficient)
             else:
                 est = build_estimation(asin, None, coefficient)
-            previous_errors = int(safe_float(old.get("consecutive_errors")) or safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
+            previous_errors = read_consecutive_errors(old)
             consecutive_errors = previous_errors + 1
             last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_success_at = old.get("last_success_at") if old is not None else None
@@ -612,7 +619,7 @@ def build_cache_updates(
             keepa_info = keepa_row_from_cache(old)
             est = build_estimation(asin, keepa_info, coefficient)
             failure_type = old.get("failure_type")
-            consecutive_errors = int(safe_float(old.get("consecutive_errors")) or safe_float(old.get("consecutive_failures")) or 0)
+            consecutive_errors = read_consecutive_errors(old)
             last_fetched_at = old.get("last_fetched_at")
             last_success_at = old.get("last_success_at")
             last_failure_at = old.get("last_failure_at")
@@ -654,6 +661,7 @@ def build_cache_updates(
                 "fetch_priority": None,
                 "next_fetch_after": next_fetch_after.strftime("%Y-%m-%d %H:%M:%S"),
                 "consecutive_errors": consecutive_errors,
+                "consecutive_failures": consecutive_errors,
                 "last_error": last_error,
                 "last_result_status": last_result_status,
                 "last_change_at": last_change_at,

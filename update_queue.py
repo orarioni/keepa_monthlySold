@@ -25,6 +25,7 @@ CACHE_COLUMNS = [
     "fetch_priority",
     "next_fetch_after",
     "consecutive_errors",
+    "consecutive_failures",
     "last_error",
     "last_result_status",
     "last_change_at",
@@ -69,6 +70,20 @@ def parse_dt(value: Any) -> datetime | None:
         return pd.to_datetime(text).to_pydatetime()
     except Exception:  # noqa: BLE001
         return None
+
+
+def read_consecutive_errors(row: Any) -> int:
+    """Backward compatibility: prefer consecutive_errors, fallback to consecutive_failures."""
+    return int(safe_float(row.get("consecutive_errors")) or safe_float(row.get("consecutive_failures")) or 0)
+
+
+def normalize_result_status(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    if not text or text == "nan":
+        return ""
+    return text
 
 
 def load_cache(cache_path: Path) -> pd.DataFrame:
@@ -141,8 +156,8 @@ def decide_fetch_queue(valid_asins: list[str], rows_seen: dict[str, int], cache:
     del rows_seen
     cache_idx = cache.set_index("asin", drop=False) if not cache.empty else pd.DataFrame(columns=CACHE_COLUMNS).set_index("asin", drop=False)
     decisions: list[QueueDecision] = []
-
-    inactive_unchanged_days = int(DEFAULT_REFRESH_POLICY["inactive_unchanged_days"])
+    policy = DEFAULT_REFRESH_POLICY
+    inactive_unchanged_days = int(policy["inactive_unchanged_days"])
 
     for asin in valid_asins:
         row = cache_idx.loc[asin] if asin in cache_idx.index else None
@@ -153,8 +168,10 @@ def decide_fetch_queue(valid_asins: list[str], rows_seen: dict[str, int], cache:
         monthly = safe_float(row.get("keepa_monthlySold"))
         next_fetch_after = parse_dt(row.get("next_fetch_after"))
         last_change_at = parse_dt(row.get("last_change_at"))
-        consecutive_errors = int(safe_float(row.get("consecutive_errors")) or safe_float(row.get("consecutive_failures")) or 0)
+        consecutive_errors = read_consecutive_errors(row)
+        last_result_status = normalize_result_status(row.get("last_result_status"))
 
+        # 1) retry/backoff lane (must be evaluated before refresh)
         if consecutive_errors >= 1:
             if next_fetch_after is None or next_fetch_after <= now:
                 decisions.append(QueueDecision(asin=asin, queued=True, decision="retry", priority="high", reason="retry_backoff_due"))
@@ -162,11 +179,28 @@ def decide_fetch_queue(valid_asins: list[str], rows_seen: dict[str, int], cache:
                 decisions.append(QueueDecision(asin=asin, queued=False, decision="skip", priority="low", reason="retry_backoff_active"))
             continue
 
+        if monthly is None and last_result_status and last_result_status != "success":
+            if next_fetch_after is None or next_fetch_after <= now:
+                decisions.append(QueueDecision(asin=asin, queued=True, decision="retry", priority="high", reason="retry_missing_monthly_sold_after_failure"))
+            else:
+                decisions.append(QueueDecision(asin=asin, queued=False, decision="skip", priority="low", reason="retry_waiting_after_failure"))
+            continue
+
+        # 2) inactive lane (low-frequency monitoring, not permanent stop)
         if monthly is None or monthly <= 0:
             if last_change_at is not None and last_change_at <= (now - timedelta(days=inactive_unchanged_days)):
-                decisions.append(QueueDecision(asin=asin, queued=False, decision="inactive", priority="low", reason="inactive_unchanged"))
+                inactive_due = next_fetch_after is None or next_fetch_after <= now
+                if inactive_due:
+                    decisions.append(QueueDecision(asin=asin, queued=True, decision="inactive", priority="low", reason="inactive_monitor_due"))
+                else:
+                    decisions.append(QueueDecision(asin=asin, queued=False, decision="inactive", priority="low", reason="inactive_monitor_wait"))
                 continue
 
+            if next_fetch_after is None:
+                decisions.append(QueueDecision(asin=asin, queued=False, decision="inactive", priority="low", reason="inactive_monitor_wait"))
+                continue
+
+        # 3) normal freshness lane
         target_priority = _get_priority(monthly)
         if next_fetch_after is None:
             decisions.append(QueueDecision(asin=asin, queued=True, decision="refresh", priority=target_priority, reason="next_fetch_after_missing"))
