@@ -11,6 +11,8 @@ from typing import Any
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from update_queue import (
     DEFAULT_REFRESH_POLICY,
@@ -23,6 +25,8 @@ from update_queue import (
 
 DEFAULT_KEEPA_DOMAIN = 5  # Amazon.co.jp
 DEFAULT_TIMEOUT_SEC = 30
+DEFAULT_CONNECT_TIMEOUT_SEC = 10
+DEFAULT_READ_TIMEOUT_SEC = 60
 DEFAULT_INPUT_FILE = "output.xlsx"
 DEFAULT_OUTPUT_FILE = "output_keepa.xlsx"
 DEFAULT_LOG_FILE = "keepa_enrich.log"
@@ -37,6 +41,12 @@ DEFAULT_MAX_ZERO_BUDGET_CYCLES = 3
 DEFAULT_MAX_TOKEN_STATUS_FAILURES = 3
 DEFAULT_MAX_BATCH_SIZE = 100
 TOKEN_COST_PER_ASIN = 1
+DEFAULT_RETRY_TOTAL = 3
+DEFAULT_RETRY_CONNECT = 3
+DEFAULT_RETRY_READ = 3
+DEFAULT_RETRY_STATUS = 3
+DEFAULT_RETRY_BACKOFF_FACTOR = 1.0
+RETRY_STATUS_FORCE_LIST = (429, 500, 502, 503, 504)
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
 TOKYO_TZ = timezone(timedelta(hours=9))
 
@@ -60,6 +70,24 @@ class KeepaCommunicationError(Exception):
 
 class KeepaProductNotFoundError(Exception):
     """Raised when Keepa returns no product for the requested ASIN."""
+
+
+class SafeStreamHandler(logging.StreamHandler):
+    """Stream handler that tolerates broken console streams on Windows/PowerShell."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except (OSError, ValueError):
+            # Keep business processing alive even if console output is broken.
+            return
+
+    def flush(self) -> None:
+        try:
+            super().flush()
+        except (OSError, ValueError):
+            # Keep business processing alive even if console output is broken.
+            return
 
 
 def get_base_dir() -> Path:
@@ -127,11 +155,32 @@ def format_keepa_last_sold_update(raw_value: Any, asin: str, logger: logging.Log
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def build_requests_session() -> requests.Session:
+    retry = Retry(
+        total=DEFAULT_RETRY_TOTAL,
+        connect=DEFAULT_RETRY_CONNECT,
+        read=DEFAULT_RETRY_READ,
+        status=DEFAULT_RETRY_STATUS,
+        backoff_factor=DEFAULT_RETRY_BACKOFF_FACTOR,
+        status_forcelist=RETRY_STATUS_FORCE_LIST,
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def fetch_keepa_products_batch(
     asins: list[str],
     api_key: str,
-    timeout_sec: int,
+    session: requests.Session,
+    connect_timeout_sec: int = DEFAULT_CONNECT_TIMEOUT_SEC,
+    read_timeout_sec: int = DEFAULT_READ_TIMEOUT_SEC,
     domain: int = DEFAULT_KEEPA_DOMAIN,
+    logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     url = "https://api.keepa.com/product"
     params = {
@@ -143,9 +192,21 @@ def fetch_keepa_products_batch(
         "buybox": 0,
     }
 
+    if logger is not None:
+        logger.info(
+            "keepa_request batch_size=%s connect_timeout=%s read_timeout=%s retry_total=%s retry_statuses=%s",
+            len(asins),
+            connect_timeout_sec,
+            read_timeout_sec,
+            DEFAULT_RETRY_TOTAL,
+            ",".join(str(code) for code in RETRY_STATUS_FORCE_LIST),
+        )
+
     try:
-        response = requests.get(url, params=params, timeout=timeout_sec)
+        response = session.get(url, params=params, timeout=(connect_timeout_sec, read_timeout_sec))
         response.raise_for_status()
+    except requests.exceptions.Timeout as exc:
+        raise KeepaCommunicationError(f"timeout_error: {exc}") from exc
     except requests.exceptions.RequestException as exc:
         raise KeepaCommunicationError(str(exc)) from exc
 
@@ -182,35 +243,35 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "max_zero_budget_cycles": config.getint("run", "max_zero_budget_cycles", fallback=DEFAULT_MAX_ZERO_BUDGET_CYCLES),
         "max_token_status_failures": config.getint("run", "max_token_status_failures", fallback=DEFAULT_MAX_TOKEN_STATUS_FAILURES),
         "refresh_policy": {
-            "communication_error_minutes": config.getint(
+            "active_high_days": config.getint(
                 "refresh_policy",
-                "communication_error_minutes",
-                fallback=DEFAULT_REFRESH_POLICY["communication_error_minutes"],
+                "active_high_days",
+                fallback=DEFAULT_REFRESH_POLICY["active_high_days"],
             ),
-            "keepa_product_not_found_days": config.getint(
+            "active_medium_days": config.getint(
                 "refresh_policy",
-                "keepa_product_not_found_days",
-                fallback=DEFAULT_REFRESH_POLICY["keepa_product_not_found_days"],
+                "active_medium_days",
+                fallback=DEFAULT_REFRESH_POLICY["active_medium_days"],
             ),
-            "monthly_sold_present_days": config.getint(
+            "active_low_days": config.getint(
                 "refresh_policy",
-                "monthly_sold_present_days",
-                fallback=DEFAULT_REFRESH_POLICY["monthly_sold_present_days"],
+                "active_low_days",
+                fallback=DEFAULT_REFRESH_POLICY["active_low_days"],
             ),
-            "sales_rank_only_days": config.getint(
+            "inactive_days": config.getint(
                 "refresh_policy",
-                "sales_rank_only_days",
-                fallback=DEFAULT_REFRESH_POLICY["sales_rank_only_days"],
+                "inactive_days",
+                fallback=DEFAULT_REFRESH_POLICY["inactive_days"],
             ),
-            "both_missing_days": config.getint(
+            "max_retry_backoff_days": config.getint(
                 "refresh_policy",
-                "both_missing_days",
-                fallback=DEFAULT_REFRESH_POLICY["both_missing_days"],
+                "max_retry_backoff_days",
+                fallback=DEFAULT_REFRESH_POLICY["max_retry_backoff_days"],
             ),
-            "other_failure_days": config.getint(
+            "inactive_unchanged_days": config.getint(
                 "refresh_policy",
-                "other_failure_days",
-                fallback=DEFAULT_REFRESH_POLICY["other_failure_days"],
+                "inactive_unchanged_days",
+                fallback=DEFAULT_REFRESH_POLICY["inactive_unchanged_days"],
             ),
         },
     }
@@ -227,30 +288,41 @@ def configure_logging(log_path: Path) -> logging.Logger:
     logger = logging.getLogger("keepa_enrich")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    logger.propagate = False
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
     logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+
+    try:
+        stream_handler = SafeStreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    except Exception:  # noqa: BLE001
+        # File logging remains active even if console handler setup fails.
+        pass
+
     return logger
 
 
 def fetch_keepa_product(
     asin: str,
     api_key: str,
-    timeout_sec: int,
+    session: requests.Session,
     logger: logging.Logger,
+    connect_timeout_sec: int = DEFAULT_CONNECT_TIMEOUT_SEC,
+    read_timeout_sec: int = DEFAULT_READ_TIMEOUT_SEC,
     domain: int = DEFAULT_KEEPA_DOMAIN,
 ) -> dict[str, Any]:
     products = fetch_keepa_products_batch(
         asins=[asin],
         api_key=api_key,
-        timeout_sec=timeout_sec,
+        session=session,
+        connect_timeout_sec=connect_timeout_sec,
+        read_timeout_sec=read_timeout_sec,
         domain=domain,
+        logger=logger,
     )
     if not products:
         raise KeepaProductNotFoundError("products is empty")
@@ -291,8 +363,10 @@ def normalize_product_for_asin(product: dict[str, Any], asin: str, logger: loggi
 def collect_keepa_data(
     asins: list[str],
     api_key: str,
-    timeout_sec: int,
+    session: requests.Session,
     logger: logging.Logger,
+    connect_timeout_sec: int = DEFAULT_CONNECT_TIMEOUT_SEC,
+    read_timeout_sec: int = DEFAULT_READ_TIMEOUT_SEC,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Fetch Keepa data by unique ASIN. Keep processing even if a subset fails."""
     data: dict[str, dict[str, Any]] = {}
@@ -310,7 +384,10 @@ def collect_keepa_data(
             products = fetch_keepa_products_batch(
                 asins=batch_asins,
                 api_key=api_key,
-                timeout_sec=timeout_sec,
+                session=session,
+                connect_timeout_sec=connect_timeout_sec,
+                read_timeout_sec=read_timeout_sec,
+                logger=logger,
             )
             products_by_asin = {normalize_asin(p.get("asin")).upper(): p for p in products}
 
@@ -455,6 +532,13 @@ def keepa_row_from_cache(cache_row: pd.Series | None) -> dict[str, Any] | None:
     }
 
 
+def read_consecutive_errors(cache_row: pd.Series | None) -> int:
+    """Backward compatibility: prefer consecutive_errors, fallback to consecutive_failures."""
+    if cache_row is None:
+        return 0
+    return int(safe_float(cache_row.get("consecutive_errors")) or safe_float(cache_row.get("consecutive_failures")) or 0)
+
+
 def build_keepa_data_from_cache(valid_asins: list[str], cache_df: pd.DataFrame) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     keepa_data: dict[str, dict[str, Any]] = {}
     cache_hit = 0
@@ -497,17 +581,18 @@ def build_cache_updates(
             keepa_info = fetched_keepa_data[asin]
             est = build_estimation(asin, keepa_info, coefficient)
             fetched_success_count += 1
-            consecutive_failures = 0
+            consecutive_errors = 0
             last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_success_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_failure_at = old.get("last_failure_at") if old is not None else None
             next_fetch_after = compute_next_fetch_after(
                 now=now,
-                failure_type=None,
                 monthly_sold=est["keepa_monthlySold"],
-                drops30=est["keepa_salesRankDrops30"],
+                consecutive_errors=consecutive_errors,
                 refresh_policy=refresh_policy,
             )
+            last_error = None
+            last_result_status = "success"
         elif attempted and failure_type:
             fetched_failure_count += 1
             if old is not None:
@@ -515,36 +600,48 @@ def build_cache_updates(
                 est = build_estimation(asin, keepa_info, coefficient)
             else:
                 est = build_estimation(asin, None, coefficient)
-            previous_failures = int(safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
-            consecutive_failures = previous_failures + 1
+            previous_errors = read_consecutive_errors(old)
+            consecutive_errors = previous_errors + 1
             last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_success_at = old.get("last_success_at") if old is not None else None
             last_failure_at = now.strftime("%Y-%m-%d %H:%M:%S")
             next_fetch_after = compute_next_fetch_after(
                 now=now,
-                failure_type=failure_type,
                 monthly_sold=est["keepa_monthlySold"],
-                drops30=est["keepa_salesRankDrops30"],
+                consecutive_errors=consecutive_errors,
                 refresh_policy=refresh_policy,
             )
+            last_error = failure_type
+            last_result_status = "failure"
         else:
             if old is None:
                 continue
             keepa_info = keepa_row_from_cache(old)
             est = build_estimation(asin, keepa_info, coefficient)
             failure_type = old.get("failure_type")
-            consecutive_failures = int(safe_float(old.get("consecutive_failures")) or 0)
+            consecutive_errors = read_consecutive_errors(old)
             last_fetched_at = old.get("last_fetched_at")
             last_success_at = old.get("last_success_at")
             last_failure_at = old.get("last_failure_at")
             next_fetch_after_text = old.get("next_fetch_after")
             next_fetch_after = pd.to_datetime(next_fetch_after_text).to_pydatetime() if next_fetch_after_text else compute_next_fetch_after(
                 now=now,
-                failure_type=failure_type,
                 monthly_sold=est["keepa_monthlySold"],
-                drops30=est["keepa_salesRankDrops30"],
+                consecutive_errors=consecutive_errors,
                 refresh_policy=refresh_policy,
             )
+            last_error = old.get("last_error")
+            last_result_status = old.get("last_result_status")
+
+        prev_monthly = safe_float(old.get("keepa_monthlySold")) if old is not None else None
+        prev_drops = safe_float(old.get("keepa_salesRankDrops30")) if old is not None else None
+        prev_last_sold = old.get("keepa_lastSoldUpdate") if old is not None else None
+        changed = (
+            prev_monthly != safe_float(est["keepa_monthlySold"])
+            or prev_drops != safe_float(est["keepa_salesRankDrops30"])
+            or prev_last_sold != est["keepa_lastSoldUpdate"]
+        )
+        last_change_at = now.strftime("%Y-%m-%d %H:%M:%S") if changed else (old.get("last_change_at") if old is not None else now.strftime("%Y-%m-%d %H:%M:%S"))
 
         updates.append(
             {
@@ -563,7 +660,11 @@ def build_cache_updates(
                 "rows_seen_in_input": rows_seen.get(asin, 0),
                 "fetch_priority": None,
                 "next_fetch_after": next_fetch_after.strftime("%Y-%m-%d %H:%M:%S"),
-                "consecutive_failures": consecutive_failures,
+                "consecutive_errors": consecutive_errors,
+                "consecutive_failures": consecutive_errors,
+                "last_error": last_error,
+                "last_result_status": last_result_status,
+                "last_change_at": last_change_at,
             }
         )
 
@@ -833,6 +934,7 @@ def main() -> None:
     settings = load_settings(base_dir)
     args = parse_args(settings)
     logger = configure_logging(settings["log_path"])
+    session = build_requests_session()
 
     api_key = settings["api_key"] or os.getenv("KEEPA_API_KEY", "").strip()
     if not api_key:
@@ -861,7 +963,13 @@ def main() -> None:
     cache_df = load_cache(settings["cache_path"])
     queue_decisions = decide_fetch_queue(valid_asins=valid_asins, rows_seen=rows_seen, cache=cache_df, now=now)
     for decision in queue_decisions:
-        logger.info("ASIN=%s queue_decision=%s fetch_priority=%s", decision.asin, decision.decision, decision.priority)
+        logger.info(
+            "ASIN=%s queue_decision=%s fetch_priority=%s reason=%s",
+            decision.asin,
+            decision.decision,
+            decision.priority,
+            decision.reason,
+        )
 
     queued_asins = sort_queued_asins(queue_decisions)
     available_tokens_at_start = 0
@@ -1033,8 +1141,10 @@ def main() -> None:
                 cycle_data, cycle_metrics = collect_keepa_data(
                     asins=batch,
                     api_key=api_key,
-                    timeout_sec=settings["timeout_sec"],
+                    session=session,
                     logger=logger,
+                    connect_timeout_sec=DEFAULT_CONNECT_TIMEOUT_SEC,
+                    read_timeout_sec=DEFAULT_READ_TIMEOUT_SEC,
                 )
                 fetched_keepa_data.update(cycle_data)
                 fetch_metrics = merge_metrics(fetch_metrics, cycle_metrics)
@@ -1095,8 +1205,10 @@ def main() -> None:
             batch_data, batch_metrics = collect_keepa_data(
                 asins=batch,
                 api_key=api_key,
-                timeout_sec=settings["timeout_sec"],
+                session=session,
                 logger=logger,
+                connect_timeout_sec=DEFAULT_CONNECT_TIMEOUT_SEC,
+                read_timeout_sec=DEFAULT_READ_TIMEOUT_SEC,
             )
             fetched_keepa_data.update(batch_data)
             fetch_metrics = merge_metrics(fetch_metrics, batch_metrics)
